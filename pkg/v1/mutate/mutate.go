@@ -16,7 +16,6 @@ package mutate
 
 import (
 	"archive/tar"
-	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -299,40 +298,45 @@ func layerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("getting layer: %v", err)
 	}
-	w := new(bytes.Buffer)
-	tarWriter := tar.NewWriter(w)
-	defer tarWriter.Close()
 
-	tarReader := tar.NewReader(layerReader)
-	for {
-		header, err := tarReader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("reading layer: %v", err)
-		}
+	pipeReader, pipeWriter := io.Pipe()
 
-		header.ModTime = t
-		if err := tarWriter.WriteHeader(header); err != nil {
-			return nil, fmt.Errorf("writing tar header: %v", err)
-		}
+	go func() {
+		tarReader := tar.NewReader(layerReader)
+		tarWriter := tar.NewWriter(pipeWriter)
 
-		if header.Typeflag == tar.TypeReg {
-			if _, err = io.Copy(tarWriter, tarReader); err != nil {
-				return nil, fmt.Errorf("writing layer file: %v", err)
+		defer layerReader.Close()
+		defer pipeWriter.Close()
+		defer tarWriter.Close()
+
+		for {
+			header, err := tarReader.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				pipeWriter.CloseWithError(err)
+				return
+			}
+
+			header.ModTime = t
+
+			if err := tarWriter.WriteHeader(header); err != nil {
+				pipeWriter.CloseWithError(err)
+				return
+			}
+
+			if _, err := io.Copy(tarWriter, tarReader); err != nil {
+				pipeWriter.CloseWithError(err)
+				return
 			}
 		}
-	}
 
-	if err := tarWriter.Close(); err != nil {
-		return nil, err
-	}
+	}()
 
-	b := w.Bytes()
 	// gzip the contents, then create the layer
 	opener := func() (io.ReadCloser, error) {
-		return v1util.GzipReadCloser(ioutil.NopCloser(bytes.NewReader(b))), nil
+		return v1util.GzipReadCloser(ioutil.NopCloser(pipeReader)), nil
 	}
 	layer, err = tarball.LayerFromOpener(opener)
 	if err != nil {
